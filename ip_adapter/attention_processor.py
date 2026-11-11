@@ -98,6 +98,9 @@ class IPAttnProcessor(nn.Module):
         self.cross_attention_dim = cross_attention_dim
         self.scale = scale
         self.num_tokens = num_tokens
+        self.profile_observer = None
+        self.profile_layer_name = None
+        self.profile_timestep = None
 
         self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
@@ -155,17 +158,53 @@ class IPAttnProcessor(nn.Module):
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # for ip-adapter
+        profile_enabled = self.profile_observer is not None and query.is_cuda and self.scale != 0
+        if profile_enabled:
+            total_start = torch.cuda.Event(enable_timing=True)
+            projection_start = torch.cuda.Event(enable_timing=True)
+            projection_end = torch.cuda.Event(enable_timing=True)
+            attention_start = torch.cuda.Event(enable_timing=True)
+            attention_end = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
+            projection_start.record()
         ip_key = self.to_k_ip(ip_hidden_states)
         ip_value = self.to_v_ip(ip_hidden_states)
 
         ip_key = attn.head_to_batch_dim(ip_key)
         ip_value = attn.head_to_batch_dim(ip_value)
+        if profile_enabled:
+            projection_end.record()
+            attention_start.record()
 
         ip_attention_probs = attn.get_attention_scores(query, ip_key, None)
         ip_hidden_states = torch.bmm(ip_attention_probs, ip_value)
         ip_hidden_states = attn.batch_to_head_dim(ip_hidden_states)
 
         hidden_states = hidden_states + self.scale * ip_hidden_states
+        if profile_enabled:
+            attention_end.record()
+            total_end.record()
+            self.profile_observer(
+                {
+                    "layer_name": self.profile_layer_name,
+                    "timestep": self.profile_timestep,
+                    "token_count": int(ip_key.shape[1]),
+                    "token_dim": int(attn.heads * ip_key.shape[2]),
+                    "dtype": str(ip_key.dtype),
+                    "scale": float(self.scale),
+                    "projection_each_step": True,
+                    "gpu_allocated_mib": torch.cuda.memory_allocated(ip_key.device) / 1024**2,
+                    "events": {
+                        "total_start": total_start,
+                        "projection_start": projection_start,
+                        "projection_end": projection_end,
+                        "attention_start": attention_start,
+                        "attention_end": attention_end,
+                        "total_end": total_end,
+                    },
+                }
+            )
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -296,6 +335,9 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.cross_attention_dim = cross_attention_dim
         self.scale = scale
         self.num_tokens = num_tokens
+        self.profile_observer = None
+        self.profile_layer_name = None
+        self.profile_timestep = None
 
         self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
@@ -367,11 +409,24 @@ class IPAttnProcessor2_0(torch.nn.Module):
         hidden_states = hidden_states.to(query.dtype)
 
         # for ip-adapter
+        profile_enabled = self.profile_observer is not None and query.is_cuda and self.scale != 0
+        if profile_enabled:
+            total_start = torch.cuda.Event(enable_timing=True)
+            projection_start = torch.cuda.Event(enable_timing=True)
+            projection_end = torch.cuda.Event(enable_timing=True)
+            attention_start = torch.cuda.Event(enable_timing=True)
+            attention_end = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
+            projection_start.record()
         ip_key = self.to_k_ip(ip_hidden_states)
         ip_value = self.to_v_ip(ip_hidden_states)
 
         ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        if profile_enabled:
+            projection_end.record()
+            attention_start.record()
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
@@ -383,6 +438,29 @@ class IPAttnProcessor2_0(torch.nn.Module):
         ip_hidden_states = ip_hidden_states.to(query.dtype)
      
         hidden_states = hidden_states + self.scale * ip_hidden_states
+        if profile_enabled:
+            attention_end.record()
+            total_end.record()
+            self.profile_observer(
+                {
+                    "layer_name": self.profile_layer_name,
+                    "timestep": self.profile_timestep,
+                    "token_count": int(ip_key.shape[2]),
+                    "token_dim": int(ip_key.shape[1] * ip_key.shape[3]),
+                    "dtype": str(ip_key.dtype),
+                    "scale": float(self.scale),
+                    "projection_each_step": True,
+                    "gpu_allocated_mib": torch.cuda.memory_allocated(ip_key.device) / 1024**2,
+                    "events": {
+                        "total_start": total_start,
+                        "projection_start": projection_start,
+                        "projection_end": projection_end,
+                        "attention_start": attention_start,
+                        "attention_end": attention_end,
+                        "total_end": total_end,
+                    },
+                }
+            )
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)

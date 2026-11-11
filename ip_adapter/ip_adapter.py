@@ -1,4 +1,5 @@
 import os
+import math
 from typing import List
 
 
@@ -455,22 +456,42 @@ def StyleProcessor(style_image, device):
 
 class StyleShot(torch.nn.Module):
     """StyleShot generation"""
-    def __init__(self, device, pipe, ip_ckpt, style_aware_encoder_ckpt, transformer_patch):
+    def __init__(
+            self,
+            device,
+            pipe,
+            ip_ckpt,
+            style_aware_encoder_ckpt,
+            transformer_patch,
+            weight_dtype=torch.float32,
+    ):
         super().__init__()
         self.num_tokens = 6
         self.device = device
         self.pipe = pipe
+        self.weight_dtype = weight_dtype
 
         self.set_ip_adapter(device)
         self.ip_ckpt = ip_ckpt
 
-        self.style_aware_encoder = Style_Aware_Encoder(CLIPVisionModelWithProjection.from_pretrained(transformer_patch)).to(self.device, dtype=torch.float32)
-        self.style_aware_encoder.load_state_dict(torch.load(style_aware_encoder_ckpt))
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            transformer_patch,
+            torch_dtype=self.weight_dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+        self.style_aware_encoder = Style_Aware_Encoder(image_encoder).to(
+            self.device,
+            dtype=self.weight_dtype,
+        )
+        self.style_aware_encoder.load_state_dict(
+            torch.load(style_aware_encoder_ckpt, map_location="cpu")
+        )
 
         self.style_image_proj_modules = self.init_proj()
 
         self.load_ip_adapter()
-        self.pipe = self.pipe.to(self.device, dtype=torch.float32)
+        self.pipe = self.pipe.to(self.device, dtype=self.weight_dtype)
 
     def init_proj(self):
         style_image_proj_modules = torch.nn.ModuleList([
@@ -489,7 +510,7 @@ class StyleShot(torch.nn.Module):
                                 clip_embeddings_dim=self.style_aware_encoder.projection_dim,
                                 clip_extra_context_tokens=2,
                             )])
-        return style_image_proj_modules.to(self.device, dtype=torch.float32)
+        return style_image_proj_modules.to(self.device, dtype=self.weight_dtype)
 
     def load_ip_adapter(self):
         sd = torch.load(self.ip_ckpt, map_location="cpu")
@@ -533,7 +554,7 @@ class StyleShot(torch.nn.Module):
                     cross_attention_dim=cross_attention_dim,
                     scale=1.0,
                     num_tokens=self.num_tokens,
-                ).to(device, dtype=torch.float16)
+                ).to(device, dtype=self.weight_dtype)
         if hasattr(self.pipe, "controlnet") and not isinstance(self.pipe, StyleContentStableDiffusionControlNetPipeline):
             if isinstance(self.pipe.controlnet, MultiControlNetModel):
                 for controlnet in self.pipe.controlnet.nets:
@@ -545,7 +566,13 @@ class StyleShot(torch.nn.Module):
     @torch.inference_mode()
     def get_image_embeds(self, style_image=None):
         style_image = StyleProcessor(style_image, self.device)
-        style_embeds = self.style_aware_encoder(style_image).to(self.device, dtype=torch.float32)
+        style_image = tuple(
+            image.to(self.device, dtype=self.weight_dtype) for image in style_image
+        )
+        style_embeds = self.style_aware_encoder(style_image).to(
+            self.device,
+            dtype=self.weight_dtype,
+        )
         style_ip_tokens = []
         uncond_style_ip_tokens = []
         for idx, style_embed in enumerate([style_embeds[:, 0, :], style_embeds[:, 1, :], style_embeds[:, 2, :]]):
@@ -617,22 +644,42 @@ class StyleShot(torch.nn.Module):
     ):
         self.set_scale(scale)
 
-        num_prompts = 1
-
         if prompt is None:
             prompt = "best quality, high quality"
         if negative_prompt is None:
             negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
-        if not isinstance(prompt, List):
-            prompt = [prompt] * num_prompts
-        if not isinstance(negative_prompt, List):
-            negative_prompt = [negative_prompt] * num_prompts
+        # Older demos passed [[prompt]], while direct callers commonly pass a
+        # string. Normalize both forms so Diffusers receives matching prompt
+        # and negative-prompt types.
+        prompts = prompt if isinstance(prompt, List) else [prompt]
+        prompts = [item[0] if isinstance(item, List) and len(item) == 1 else item for item in prompts]
+        negative_prompts = negative_prompt if isinstance(negative_prompt, List) else [negative_prompt]
+        negative_prompts = [
+            item[0] if isinstance(item, List) and len(item) == 1 else item
+            for item in negative_prompts
+        ]
+        if len(negative_prompts) == 1 and len(prompts) > 1:
+            negative_prompts *= len(prompts)
+        if len(negative_prompts) != len(prompts):
+            raise ValueError("negative_prompt must contain one item or match the number of prompts")
 
         style_ip_tokens, uncond_style_ip_tokens = self.get_image_embeds(style_image)
         generate_images = []
-        for p in prompt:
-            images = self.samples(style_ip_tokens, uncond_style_ip_tokens, num_samples, self.device, p * num_prompts, negative_prompt, seed, guidance_scale, num_inference_steps, content_image, **kwargs, )
+        for p, n in zip(prompts, negative_prompts):
+            images = self.samples(
+                style_ip_tokens,
+                uncond_style_ip_tokens,
+                num_samples,
+                self.device,
+                p,
+                n,
+                seed,
+                guidance_scale,
+                num_inference_steps,
+                content_image,
+                **kwargs,
+            )
             generate_images.append(images)
         return generate_images
 
@@ -669,6 +716,9 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         style_embeddings: Optional[torch.FloatTensor] = None,
         negative_style_embeddings: Optional[torch.FloatTensor] = None,
+        style_cross_attention_enabled: bool = True,
+        style_cross_attention_start: float = 0.0,
+        style_cross_attention_end: float = 1.0,
         **kwargs,
     ):
         r"""
@@ -778,6 +828,11 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
 
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
+
+        if not 0.0 <= float(style_cross_attention_start) <= float(style_cross_attention_end) <= 1.0:
+            raise ValueError(
+                "style cross-attention window must satisfy 0 <= start <= end <= 1"
+            )
 
         if callback is not None:
             deprecate(
@@ -923,6 +978,23 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         self._num_timesteps = len(timesteps)
 
+        # Preserve StyleShot's configured style strength while independently
+        # gating its image-style cross-attention contribution by denoising step.
+        style_attention_processors = [
+            processor
+            for processor in self.unet.attn_processors.values()
+            if isinstance(processor, IPAttnProcessor)
+        ]
+        style_attention_scales = [float(processor.scale) for processor in style_attention_processors]
+        style_start_step = min(
+            len(timesteps),
+            math.floor(float(style_cross_attention_start) * len(timesteps)),
+        )
+        style_end_step = min(
+            len(timesteps),
+            math.ceil(float(style_cross_attention_end) * len(timesteps)),
+        )
+
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
@@ -968,8 +1040,20 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
         is_unet_compiled = is_compiled_module(self.unet)
         is_controlnet_compiled = is_compiled_module(self.controlnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
+        self._last_style_cross_attention_steps = []
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                style_cross_attention_active = bool(style_cross_attention_enabled) and (
+                    style_start_step <= i < style_end_step
+                )
+                if style_cross_attention_active:
+                    self._last_style_cross_attention_steps.append(i)
+                for processor, base_scale in zip(style_attention_processors, style_attention_scales):
+                    processor.scale = base_scale if style_cross_attention_active else 0.0
+
+                qkv_controller = getattr(self, "qkv_controller", None)
+                if qkv_controller is not None:
+                    qkv_controller.set_step(i, t)
                 # Relevant thread:
                 # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
                 if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
@@ -997,7 +1081,18 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
                 if self.do_classifier_free_guidance:
-                    style_embeddings_input = torch.cat([negative_style_embeddings, style_embeddings])
+                    if style_cross_attention_active:
+                        style_embeddings_input = torch.cat([negative_style_embeddings, style_embeddings])
+                    else:
+                        style_embeddings_input = torch.cat(
+                            [negative_style_embeddings, negative_style_embeddings]
+                        )
+                else:
+                    style_embeddings_input = (
+                        style_embeddings
+                        if style_cross_attention_active
+                        else negative_style_embeddings
+                    )
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
@@ -1053,6 +1148,9 @@ class StyleContentStableDiffusionControlNetPipeline(StableDiffusionControlNetPip
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+        for processor, base_scale in zip(style_attention_processors, style_attention_scales):
+            processor.scale = base_scale
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings

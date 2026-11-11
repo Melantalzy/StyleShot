@@ -1,3 +1,59 @@
-__pycache__
-*/__pycache__
-**/__pycache__
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editors, OS files, logs, and temporary files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+*token*.txt
+
+# Downloaded model repositories and checkpoints
+/runwayml/
+/laion/
+/Gaojunyao/
+/annotator/ckpts/
+/.cache/
+**/.cache/huggingface/
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+*.onnx
+
+# Datasets and local test corpora
+/StyleBench/
+/data/
+/dataset/
+/datasets/
+
+# Generated images, profiles, and experiment results
+/outputs/
+/results/
+/generated/
+/runs/
+/wandb/

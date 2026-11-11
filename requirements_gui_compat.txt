@@ -1,0 +1,9 @@
+# Compatibility pins for styleshot_local_gui.py (Python 3.10).
+# Install these after the CUDA/PyTorch environment has been created.
+gradio==4.37.2
+gradio-client==1.0.2
+fastapi==0.111.0
+starlette==0.37.2
+pydantic==2.7.4
+MarkupSafe==2.1.5
+websockets==11.0.3
